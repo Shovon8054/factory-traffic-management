@@ -1,0 +1,117 @@
+{
+  "info": {
+    "name": "Factory Traffic Management API",
+    "description": "REST requests for junction status, sensor ingestion, traffic commands, controller acknowledgements, and junction history.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:5000/api" },
+    { "key": "junctionId", "value": "A" },
+    { "key": "commandId", "value": "replace-with-persisted-command-id" }
+  ],
+  "item": [
+    {
+      "name": "Junctions",
+      "item": [
+        {
+          "name": "List junctions",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/junctions"
+          }
+        },
+        {
+          "name": "Get junction status",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/junctions/{{junctionId}}/status"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Sensor events",
+      "item": [
+        {
+          "name": "Vehicle arrived",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"eventId\": \"{{$guid}}\",\n  \"junctionId\": \"{{junctionId}}\",\n  \"direction\": \"NORTH\",\n  \"eventType\": \"ARRIVED\",\n  \"vehicleId\": \"{{$guid}}\",\n  \"vehicleType\": \"CAR\",\n  \"sequenceNo\": 1,\n  \"sensorTimestamp\": \"{{$isoTimestamp}}\"\n}"
+            },
+            "url": "{{baseUrl}}/sensor-events"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Commands",
+      "item": [
+        {
+          "name": "Request manual phase",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"MANUAL_MODE_REQUEST\",\n  \"junctionId\": \"{{junctionId}}\",\n  \"phase\": \"EAST_WEST\"\n}"
+            },
+            "url": "{{baseUrl}}/commands"
+          }
+        },
+        {
+          "name": "List junction commands",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/commands?junctionId={{junctionId}}&limit=100"
+          }
+        },
+        {
+          "name": "Get command by ID",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/commands/{{commandId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Controller events",
+      "item": [
+        {
+          "name": "Acknowledge command",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"commandId\": \"{{commandId}}\",\n  \"junctionId\": \"{{junctionId}}\",\n  \"status\": \"ACKNOWLEDGED\",\n  \"actualState\": \"YELLOW\"\n}"
+            },
+            "url": "{{baseUrl}}/controller-events"
+          }
+        },
+        {
+          "name": "List controller events",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/controller-events?junctionId={{junctionId}}&limit=100"
+          }
+        }
+      ]
+    },
+    {
+      "name": "History",
+      "item": [
+        {
+          "name": "List junction history",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/history?junctionId={{junctionId}}&limit=100"
+          }
+        }
+      ]
+    }
+  ]
+}
