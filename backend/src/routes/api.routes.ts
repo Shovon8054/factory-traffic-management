@@ -138,6 +138,7 @@ export function createApiRouter(dependencies?: ApiControllerDependencies): Route
     const ack = controllerAckSchema.parse(request.body);
     sendResult(response, await controller.controllerAck({
       ...ack,
+      commandId: ack.commandId ?? null,
       actualState: ack.actualState ?? null,
     }, Date.now()));
   }));

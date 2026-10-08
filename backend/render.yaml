@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: factory-traffic-backend
+    env: node
+    plan: free
+    buildCommand: npm install --prefix backend && npm run build --prefix backend
+    startCommand: npm start --prefix backend
+    envVars:
+      - key: DATABASE_URL
+        value: "postgresql://postgres.tkgpnjtzzbjatabdqnyy:Hasinapalaise26@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres"
+      - key: PORT
+        value: "10000"
+      - key: FRONTEND_ORIGIN
+        value: "https://[YOUR-VERCEL-FRONTEND-DOMAIN]"
