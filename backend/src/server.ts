@@ -22,9 +22,15 @@ junctionService.setEmitter((event) => {
   io.emit("junction:update", event);
 });
 
+persistentCommandService.setJunctionService(junctionService);
+
 persistentCommandService.setEmitter(async (event) => {
   io.emit("controller:ack", event);
-  if (event.result !== "MATCHED") return;
+  if (event.type === "CONTROLLER_ALERT") {
+    io.emit("controller:alert", event);
+    return;
+  }
+  if (event.result !== "MATCHED" || !event.ack) return;
 
   const command = await getCommandById(event.ack.commandId);
   const phase = command?.direction;
@@ -66,8 +72,13 @@ const startServer = async () => {
     console.log(`Startup recovery completed for ${junctionIds.length} junction(s)`);
     setApiReady(true);
 
-    setInterval(() => {
+    setInterval(async () => {
       const now = Date.now();
+      try {
+        await persistentCommandService.checkTimeouts(now, junctionService);
+      } catch (error) {
+        console.error("Command timeout check failed:", error);
+      }
       for (const junctionId of junctionIds) {
         void junctionService.process(junctionId, { type: "TICK" }, now).catch((error: unknown) => {
           console.error(`Junction tick failed for ${junctionId}:`, error);

@@ -177,6 +177,17 @@
   color: #37e181;
 }
 
+.signal-lens.unlit {
+  opacity: 0.22;
+  filter: grayscale(80%);
+}
+
+.signal-lens.desired-target {
+  outline: 2px dashed #ffffff;
+  outline-offset: 2px;
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.8);
+}
+
 .signal-stack[aria-label*="actual UNKNOWN"] {
   outline: 1px dashed #a6b5ae;
   outline-offset: 3px;

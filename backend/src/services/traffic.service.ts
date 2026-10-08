@@ -13,6 +13,7 @@ export type VehicleType =
   | "MOTORCYCLE"
   | "BUS"
   | "TRUCK"
+  | "FORKLIFT"
   | "EMERGENCY"
   | "EMPLOYEE_VEHICLE";
 
@@ -29,6 +30,7 @@ export interface JunctionConfig {
   antiFlapMs: number;
   starvationMs: number;
   maxGreenMs: number;
+  scoreSwitchMargin: number;
   emergencyTtlMs: number;
   emergencyStaleMs: number;
   manualTtlMs: number;
@@ -36,8 +38,10 @@ export interface JunctionConfig {
 
 export interface EmergencyRequest {
   emergencyId: string;
+  vehicleId: string;
   phase: Phase;
   receivedAt: number;
+  lastSeenAt: number;
   expiresAt: number;
 }
 
@@ -71,8 +75,8 @@ export interface JunctionState {
 export type TrafficInput =
   | { type: "TICK" }
   | { type: "TARGET_PHASE_REQUEST"; phase: Phase }
-  | { type: "EMERGENCY_REQUEST"; emergencyId: string; phase: Phase; occurredAt: number }
-  | { type: "MANUAL_MODE_REQUEST"; phase: Phase }
+  | { type: "EMERGENCY_REQUEST"; emergencyId: string; phase: Phase; occurredAt: number; vehicleId?: string }
+  | { type: "MANUAL_MODE_REQUEST"; phase: Phase; direction?: Direction }
   | { type: "RETURN_TO_AUTOMATIC" }
   | {
       type: "VEHICLE_ARRIVED";
@@ -82,34 +86,143 @@ export type TrafficInput =
     }
   | { type: "VEHICLE_CLEARED"; direction: Direction; vehicleId: string };
 
-export interface TrafficEffect {
+export interface SetDesiredSignalsEffect {
   type: "SET_DESIRED_SIGNALS";
   phase: Phase;
   step: PhaseStep;
   signals: Record<Direction, SignalState>;
 }
 
+export interface UnsafeStateAuditEffect {
+  type: "AUDIT_UNSAFE_STATE";
+  reason: string;
+}
+
+export type TrafficEffect = SetDesiredSignalsEffect | UnsafeStateAuditEffect;
+
+export interface PhaseScoreContribution {
+  direction: Direction;
+  vehicleId: string;
+  vehicleType: VehicleType;
+  weight: number;
+}
+
+export interface PhaseScoreBreakdown {
+  phase: Phase;
+  score: number;
+  contributions: PhaseScoreContribution[];
+}
+
+const validDirections = new Set<Direction>(["NORTH", "SOUTH", "EAST", "WEST"]);
+const validPhases = new Set<Phase>(["NORTH_SOUTH", "EAST_WEST"]);
+const validVehicleTypes = new Set<VehicleType>([
+  "CAR",
+  "MOTORCYCLE",
+  "BUS",
+  "TRUCK",
+  "FORKLIFT",
+  "EMERGENCY",
+  "EMPLOYEE_VEHICLE",
+]);
+
+function isValidTrafficInput(input: unknown): input is TrafficInput {
+  if (typeof input !== "object" || input === null || !("type" in input)) return false;
+  const candidate = input as Record<string, unknown>;
+
+  switch (candidate.type) {
+    case "TICK":
+    case "RETURN_TO_AUTOMATIC":
+      return true;
+    case "TARGET_PHASE_REQUEST":
+    case "MANUAL_MODE_REQUEST":
+      return typeof candidate.phase === "string" && validPhases.has(candidate.phase as Phase) &&
+        (candidate.direction === undefined ||
+          (typeof candidate.direction === "string" && validDirections.has(candidate.direction as Direction)));
+    case "EMERGENCY_REQUEST":
+      return typeof candidate.emergencyId === "string" && candidate.emergencyId.length > 0 &&
+        typeof candidate.phase === "string" && validPhases.has(candidate.phase as Phase) &&
+        typeof candidate.occurredAt === "number" && Number.isFinite(candidate.occurredAt) &&
+        (candidate.vehicleId === undefined || (typeof candidate.vehicleId === "string" && candidate.vehicleId.length > 0));
+    case "VEHICLE_ARRIVED":
+      return typeof candidate.direction === "string" && validDirections.has(candidate.direction as Direction) &&
+        typeof candidate.vehicleId === "string" && candidate.vehicleId.length > 0 &&
+        typeof candidate.vehicleType === "string" && validVehicleTypes.has(candidate.vehicleType as VehicleType);
+    case "VEHICLE_CLEARED":
+      return typeof candidate.direction === "string" && validDirections.has(candidate.direction as Direction) &&
+        typeof candidate.vehicleId === "string" && candidate.vehicleId.length > 0;
+    default:
+      return false;
+  }
+}
+
+function hasConflictingGreens(state: JunctionState): boolean {
+  return [state.desired.signals, state.actual.signals].some((signals) => {
+    const northSouthGreen = signals.NORTH === "GREEN" || signals.SOUTH === "GREEN";
+    const eastWestGreen = signals.EAST === "GREEN" || signals.WEST === "GREEN";
+    return northSouthGreen && eastWestGreen;
+  });
+}
+
+function recoverUnsafeState(
+  state: JunctionState,
+  now: number,
+): { state: JunctionState; effects: TrafficEffect[] } {
+  const phase = validPhases.has(state.desired.phase) ? state.desired.phase : "NORTH_SOUTH";
+  const redSignals = { ...ALL_RED_SIGNALS };
+  const unknownSignals: Record<Direction, SignalState> = {
+    NORTH: "UNKNOWN",
+    SOUTH: "UNKNOWN",
+    EAST: "UNKNOWN",
+    WEST: "UNKNOWN",
+  };
+  const nextState: JunctionState = {
+    ...state,
+    mode: "DEGRADED",
+    pendingPhase: null,
+    desired: { phase, step: "ALL_RED", signals: redSignals },
+    actual: { phase, step: "UNKNOWN", signals: unknownSignals, confirmedAt: now },
+  };
+
+  return {
+    state: nextState,
+    effects: [
+      { type: "SET_DESIRED_SIGNALS", phase, step: "ALL_RED", signals: redSignals },
+      { type: "AUDIT_UNSAFE_STATE", reason: "Conflicting GREEN signals found in engine input state" },
+    ],
+  };
+}
+
 export const DEFAULT_JUNCTION_CONFIG: JunctionConfig = {
   phases: ["NORTH_SOUTH", "EAST_WEST"],
   durations: {
-    GREEN: 30_000,
-    YELLOW: 3_000,
-    ALL_RED: 1_000,
+    GREEN: typeof process !== "undefined" && process.env.GREEN_DURATION_MS
+      ? Number(process.env.GREEN_DURATION_MS)
+      : 30_000,
+    YELLOW: typeof process !== "undefined" && process.env.YELLOW_DURATION_MS
+      ? Number(process.env.YELLOW_DURATION_MS)
+      : 3_000,
+    ALL_RED: typeof process !== "undefined" && process.env.ALL_RED_DURATION_MS
+      ? Number(process.env.ALL_RED_DURATION_MS)
+      : 1_000,
   },
   vehiclePriorityWeights: {
     CAR: 1,
     MOTORCYCLE: 1.2,
     BUS: 2,
     TRUCK: 1.5,
+    FORKLIFT: 2.5,
     EMERGENCY: 10,
     EMPLOYEE_VEHICLE: 1.25,
   },
   antiFlapMs: 5_000,
   starvationMs: 90_000,
   maxGreenMs: 60_000,
+  scoreSwitchMargin: 0.5,
   emergencyTtlMs: 120_000,
   emergencyStaleMs: 30_000,
-  manualTtlMs: 300_000,
+  manualTtlMs: typeof process !== "undefined" && process.env.MANUAL_TTL_MS
+    ? Number(process.env.MANUAL_TTL_MS)
+    : 300_000,
 };
 
 const ALL_RED_SIGNALS: Record<Direction, SignalState> = {
@@ -194,6 +307,24 @@ function scorePhase(state: JunctionState, phase: Phase): number {
       ),
     0,
   );
+}
+
+export function getPhaseScoreBreakdown(state: JunctionState): PhaseScoreBreakdown[] {
+  return state.config.phases.map((phase) => {
+    const contributions = directionsForPhase(phase).flatMap((direction) =>
+      state.queues[direction].map((vehicle) => ({
+        direction,
+        vehicleId: vehicle.vehicleId,
+        vehicleType: vehicle.type,
+        weight: state.config.vehiclePriorityWeights[vehicle.type],
+      })),
+    );
+    return {
+      phase,
+      score: contributions.reduce((total, contribution) => total + contribution.weight, 0),
+      contributions,
+    };
+  });
 }
 
 function oldestWaitForPhase(state: JunctionState, phase: Phase, now: number): number {
@@ -281,6 +412,40 @@ function updateVehicleQueue(
   };
 }
 
+function refreshOrAddEmergency(
+  state: JunctionState,
+  emergencyId: string,
+  vehicleId: string,
+  phase: Phase,
+  now: number,
+): { state: JunctionState; added: boolean } {
+  const existing = state.emergencyRequests.find(
+    (request) => request.emergencyId === emergencyId || request.vehicleId === vehicleId,
+  );
+  if (existing !== undefined) {
+    return {
+      state: {
+        ...state,
+        mode: "EMERGENCY",
+        emergencyRequests: state.emergencyRequests.map((request) =>
+          request === existing ? { ...request, lastSeenAt: now } : request,
+        ),
+      },
+      added: false,
+    };
+  }
+
+  const emergencyRequests = [...state.emergencyRequests, {
+    emergencyId,
+    vehicleId,
+    phase,
+    receivedAt: now,
+    lastSeenAt: now,
+    expiresAt: now + state.config.emergencyTtlMs,
+  }].sort((left, right) => left.receivedAt - right.receivedAt);
+  return { state: { ...state, emergencyRequests, mode: "EMERGENCY" }, added: true };
+}
+
 export function assertSafe(state: JunctionState): void {
   for (const [label, signals] of [
     ["desired", state.desired.signals],
@@ -301,7 +466,8 @@ export function decide(
   input: TrafficInput,
   now: number,
 ): { state: JunctionState; effects: TrafficEffect[] } {
-  assertSafe(state);
+  if (hasConflictingGreens(state)) return recoverUnsafeState(state, now);
+  if (!isValidTrafficInput(input)) return { state, effects: [] };
 
   if (state.mode === "DEGRADED" && input.type === "TICK") {
     return { state, effects: [] };
@@ -316,39 +482,16 @@ export function decide(
       return { state, effects: [] };
     }
 
-    const existing = state.emergencyRequests.find(
-      (request) => request.emergencyId === input.emergencyId,
+    const refreshed = refreshOrAddEmergency(
+      state,
+      input.emergencyId,
+      input.vehicleId ?? input.emergencyId,
+      input.phase,
+      now,
     );
-    if (existing) {
-      const refreshed = {
-        ...existing,
-        expiresAt: now + state.config.emergencyTtlMs,
-      };
-      return {
-        state: {
-          ...state,
-          emergencyRequests: state.emergencyRequests.map((request) =>
-            request.emergencyId === input.emergencyId ? refreshed : request,
-          ),
-        },
-        effects: [],
-      };
-    }
-
-    const emergencyRequests = [
-      ...state.emergencyRequests,
-      {
-        emergencyId: input.emergencyId,
-        phase: input.phase,
-        receivedAt: now,
-        expiresAt: now + state.config.emergencyTtlMs,
-      },
-    ].sort((left, right) => left.receivedAt - right.receivedAt);
-    const nextState = { ...state, emergencyRequests, mode: "EMERGENCY" as const };
-    const firstRequest = emergencyRequests[0];
-    return firstRequest === undefined
-      ? { state: nextState, effects: [] }
-      : requestPhase(nextState, firstRequest.phase);
+    const activePhase = activeRequestedPhase(refreshed.state);
+    if (!refreshed.added || activePhase === null) return { state: refreshed.state, effects: [] };
+    return requestPhase(refreshed.state, activePhase);
   }
 
   if (input.type === "MANUAL_MODE_REQUEST") {
@@ -377,11 +520,48 @@ export function decide(
   }
 
   if (input.type === "VEHICLE_ARRIVED" || input.type === "VEHICLE_CLEARED") {
-    return { state: updateVehicleQueue(state, input, now), effects: [] };
+    const queueState = updateVehicleQueue(state, input, now);
+    if (input.type === "VEHICLE_ARRIVED") {
+      if (input.vehicleType !== "EMERGENCY") return { state: queueState, effects: [] };
+      const refreshed = refreshOrAddEmergency(
+        queueState,
+        input.vehicleId,
+        input.vehicleId,
+        phaseForDirection(input.direction),
+        now,
+      );
+      const activePhase = activeRequestedPhase(refreshed.state);
+      return activePhase === null
+        ? { state: refreshed.state, effects: [] }
+        : requestPhase(refreshed.state, activePhase);
+    }
+
+    const remainingEmergencies = queueState.emergencyRequests.filter(
+      (request) => request.vehicleId !== input.vehicleId && request.emergencyId !== input.vehicleId,
+    );
+    if (remainingEmergencies.length === queueState.emergencyRequests.length) {
+      return { state: queueState, effects: [] };
+    }
+    const afterEmergencyClear: JunctionState = {
+      ...queueState,
+      emergencyRequests: remainingEmergencies,
+      mode: effectiveMode({ ...queueState, emergencyRequests: remainingEmergencies }),
+    };
+    const nextRequestedPhase = activeRequestedPhase(afterEmergencyClear);
+    if (nextRequestedPhase !== null) return requestPhase(afterEmergencyClear, nextRequestedPhase);
+    if (afterEmergencyClear.desired.step === "GREEN") {
+      return { state: { ...afterEmergencyClear, pendingPhase: null }, effects: [] };
+    }
+    return {
+      state: { ...afterEmergencyClear, pendingPhase: afterEmergencyClear.desired.phase },
+      effects: [],
+    };
   }
 
   const previousRequestedPhase = activeRequestedPhase(state);
-  const emergencyRequests = state.emergencyRequests.filter((request) => request.expiresAt > now);
+  const emergencyRequests = state.emergencyRequests.filter((request) =>
+    request.expiresAt > now && now - request.lastSeenAt <= state.config.emergencyStaleMs,
+  );
   const manualOverride = state.manualOverride !== null && state.manualOverride.expiresAt > now
     ? state.manualOverride
     : null;
@@ -415,15 +595,24 @@ export function decide(
     const targetPhase = selectedPhase === state.desired.phase && maxGreenReached
       ? selectAlternativePhase(state)
       : selectedPhase;
+    const currentScore = scorePhase(state, state.desired.phase);
+    const targetScore = targetPhase === null ? 0 : scorePhase(state, targetPhase);
     const selectedPhaseIsStarved = targetPhase !== null &&
       oldestWaitForPhase(state, targetPhase, now) >= state.config.starvationMs;
     const antiFlapElapsed = greenAge >= state.config.antiFlapMs;
+    const scoreAdvantageReached = targetScore - currentScore >= state.config.scoreSwitchMargin;
+    const otherPhaseHasTraffic = targetScore > 0;
 
     if (
       greenConfirmed &&
       targetPhase !== null &&
       targetPhase !== state.desired.phase &&
-      (selectedPhaseIsStarved || maxGreenReached || (greenElapsed && antiFlapElapsed))
+      otherPhaseHasTraffic &&
+      (
+        selectedPhaseIsStarved ||
+        maxGreenReached ||
+        (greenElapsed && antiFlapElapsed && scoreAdvantageReached)
+      )
     ) {
       return createTransition(state, state.desired.phase, "YELLOW", targetPhase);
     }
@@ -451,4 +640,8 @@ export function decide(
   }
 
   return { state, effects: [] };
+}
+
+function phaseForDirection(direction: Direction): Phase {
+  return direction === "NORTH" || direction === "SOUTH" ? "NORTH_SOUTH" : "EAST_WEST";
 }

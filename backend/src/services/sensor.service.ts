@@ -7,12 +7,14 @@ import {
 import {
   getLatestSensorSequence,
   getLatestSensorTimestamp,
+  getActiveSensorVehicles,
   getSensorEventById,
   insertSensorEvent,
+  type ActiveSensorVehicleRow,
   type SensorEventInput,
 } from "../models/sensor.model.ts";
 import { appendHistory } from "../models/history.model.ts";
-import type { Direction, TrafficInput, VehicleType } from "./traffic.service.ts";
+import type { Direction, Phase, TrafficInput, VehicleType } from "./traffic.service.ts";
 import { JunctionService, junctionService } from "./junction.service.ts";
 
 const VALID_DIRECTIONS = new Set<Direction>(["NORTH", "SOUTH", "EAST", "WEST"]);
@@ -21,6 +23,7 @@ const VALID_VEHICLE_TYPES = new Set<VehicleType>([
   "MOTORCYCLE",
   "BUS",
   "TRUCK",
+  "FORKLIFT",
   "EMERGENCY",
   "EMPLOYEE_VEHICLE",
 ]);
@@ -38,7 +41,8 @@ export interface SensorEvent extends SensorEventInput {
 
 export type SensorHandlingResult =
   | { status: "ACCEPTED"; state: Awaited<ReturnType<JunctionService["process"]>> }
-  | { status: "DUPLICATE" | "OUT_OF_ORDER" | "STALE"; reason: string }
+  | { status: "DUPLICATE"; duplicate: true; reason: string }
+  | { status: "OUT_OF_ORDER" | "STALE" | "UNMATCHED_CLEAR"; reason: string }
   | { status: "INVALID"; reason: string };
 
 export interface SensorServiceDependencies {
@@ -55,6 +59,10 @@ export interface SensorServiceDependencies {
     direction: string,
     client: PoolClient,
   ): Promise<Date | null>;
+  getActiveVehicles(
+    junctionId: string,
+    client: PoolClient,
+  ): ReturnType<typeof getActiveSensorVehicles>;
   insertSensorEvent(event: SensorEventInput, client: PoolClient): ReturnType<typeof insertSensorEvent>;
   appendAudit(client: PoolClient, entry: Parameters<typeof appendHistory>[0]): Promise<unknown>;
 }
@@ -72,6 +80,7 @@ const defaultDependencies: SensorServiceDependencies = {
     getLatestSensorSequence(junctionId, direction, client),
   getLatestSensorTimestamp: (junctionId, direction, client) =>
     getLatestSensorTimestamp(junctionId, direction, client),
+  getActiveVehicles: (junctionId, client) => getActiveSensorVehicles(junctionId, client),
   insertSensorEvent: (event, client) => insertSensorEvent(event, client),
   appendAudit: (client, entry) => appendHistory(entry, client),
 };
@@ -96,7 +105,27 @@ export class SensorService {
         const existing = await this.dependencies.getSensorEventById(event.eventId, client);
         if (existing !== undefined) {
           await this.audit(client, event, "DUPLICATE", { duplicateEventId: event.eventId });
-          return { result: { status: "DUPLICATE", reason: "event_id already processed" } };
+          const isEmergencyArrival =
+            (event.eventType === "ARRIVED" || event.eventType === "VEHICLE_ARRIVED") &&
+            event.vehicleType === "EMERGENCY" &&
+            existing.vehicle_type === "EMERGENCY" &&
+            now - event.sensorTimestamp.getTime() <= this.staleAfterMs;
+          if (isEmergencyArrival) {
+            const committed = await this.junctionService.processLocked(client, junction, {
+              type: "EMERGENCY_REQUEST",
+              emergencyId: event.vehicleId,
+              vehicleId: event.vehicleId,
+              phase: this.phaseForDirection(event.direction as Direction),
+              occurredAt: now,
+            }, now);
+            return {
+              result: { status: "DUPLICATE", duplicate: true, reason: "emergency last-seen refreshed" },
+              committed,
+            };
+          }
+          return {
+            result: { status: "DUPLICATE", duplicate: true, reason: "event_id already processed" },
+          };
         }
 
         const staleAt = now - this.staleAfterMs;
@@ -123,13 +152,72 @@ export class SensorService {
           return { result: { status: "OUT_OF_ORDER", reason: "sequence or timestamp is not newer" } };
         }
 
+        const activeVehicles = await this.dependencies.getActiveVehicles(event.junctionId, client);
+        const matchingActiveVehicle = activeVehicles.find(
+          (vehicle) => vehicle.vehicle_id === event.vehicleId,
+        );
+        const isArrival = event.eventType === "ARRIVED" || event.eventType === "VEHICLE_ARRIVED";
+        if (isArrival && matchingActiveVehicle !== undefined) {
+          const isEmergencyRefresh = event.vehicleType === "EMERGENCY" &&
+            matchingActiveVehicle.vehicle_type === "EMERGENCY";
+          if (isEmergencyRefresh) {
+            const insertedRefresh = await this.dependencies.insertSensorEvent({
+              ...event,
+              status: "PROCESSED",
+            }, client);
+            if (insertedRefresh === undefined) {
+              await this.audit(client, event, "DUPLICATE", { duplicateEventId: event.eventId });
+              return {
+                result: { status: "DUPLICATE", duplicate: true, reason: "event_id already processed" },
+              };
+            }
+            const committed = await this.junctionService.processLocked(client, junction, {
+              type: "EMERGENCY_REQUEST",
+              emergencyId: event.vehicleId,
+              vehicleId: event.vehicleId,
+              phase: this.phaseForDirection(event.direction as Direction),
+              occurredAt: now,
+            }, now);
+            await this.audit(client, event, "EMERGENCY_REFRESHED", { sensorRowId: insertedRefresh.id });
+            return {
+              result: { status: "ACCEPTED", state: committed.state },
+              committed,
+            };
+          }
+
+          await this.dependencies.insertSensorEvent({ ...event, status: "DUPLICATE_VEHICLE" }, client);
+          await this.audit(client, event, "DUPLICATE_VEHICLE", {
+            activeDirection: matchingActiveVehicle.direction,
+          });
+          return {
+            result: {
+              status: "DUPLICATE",
+              duplicate: true,
+              reason: "vehicleId is already active in a junction queue",
+            },
+          };
+        }
+
+        const isClear = event.eventType === "CLEARED" || event.eventType === "VEHICLE_CLEARED";
+        if (
+          isClear &&
+          !activeVehicles.some((vehicle) =>
+            vehicle.vehicle_id === event.vehicleId && vehicle.direction === event.direction,
+          )
+        ) {
+          await this.recordRejected(client, event, "UNMATCHED_CLEAR", "vehicle has no active arrival in this direction");
+          return {
+            result: { status: "UNMATCHED_CLEAR", reason: "vehicle has no active arrival in this direction" },
+          };
+        }
+
         const inserted = await this.dependencies.insertSensorEvent({
           ...event,
           status: "PROCESSED",
         }, client);
         if (inserted === undefined) {
           await this.audit(client, event, "DUPLICATE", { duplicateEventId: event.eventId });
-          return { result: { status: "DUPLICATE", reason: "event_id already processed" } };
+          return { result: { status: "DUPLICATE", duplicate: true, reason: "event_id already processed" } };
         }
 
         const input = this.toTrafficInput(event);
@@ -186,10 +274,14 @@ export class SensorService {
     return { type: "VEHICLE_CLEARED", direction, vehicleId: event.vehicleId };
   }
 
+  private phaseForDirection(direction: Direction): Phase {
+    return direction === "NORTH" || direction === "SOUTH" ? "NORTH_SOUTH" : "EAST_WEST";
+  }
+
   private async recordRejected(
     client: PoolClient,
     event: SensorEvent,
-    status: "STALE" | "OUT_OF_ORDER",
+    status: "STALE" | "OUT_OF_ORDER" | "UNMATCHED_CLEAR",
     reason: string,
   ): Promise<void> {
     await this.dependencies.insertSensorEvent({ ...event, status }, client);

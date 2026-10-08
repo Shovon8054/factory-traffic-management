@@ -17,6 +17,7 @@ import type {
   JunctionState,
   Mode,
   Phase,
+  SetDesiredSignalsEffect,
   TrafficEffect,
   TrafficInput,
   VehicleType,
@@ -62,7 +63,7 @@ export interface JunctionServiceDependencies {
   persistEffect(
     client: PoolClient,
     junctionId: string,
-    effect: TrafficEffect,
+    effect: SetDesiredSignalsEffect,
     now: number,
   ): Promise<PersistedControllerCommand>;
   executeEffect(command: PersistedControllerCommand): Promise<void>;
@@ -259,6 +260,14 @@ export class JunctionService {
       }) ||
       result.state.manualOverride?.phase !== state.manualOverride?.phase ||
       result.state.manualOverride?.expiresAt !== state.manualOverride?.expiresAt;
+    const addedEmergencies = result.state.emergencyRequests.filter(
+      (request) => !state.emergencyRequests.some((previous) => previous.emergencyId === request.emergencyId),
+    );
+    const removedEmergencies = state.emergencyRequests.filter(
+      (previous) => !result.state.emergencyRequests.some((request) => request.emergencyId === previous.emergencyId),
+    );
+    const transitionStarted = state.desired.step === "GREEN" &&
+      result.effects.some((effect) => effect.type === "SET_DESIRED_SIGNALS" && effect.step === "YELLOW");
     const idleTick = input.type === "TICK" &&
       result.effects.length === 0 && !queueChanged && !stateChanged;
 
@@ -281,24 +290,77 @@ export class JunctionService {
 
     const commands: PersistedControllerCommand[] = [];
     for (const effect of result.effects) {
-      commands.push(await this.dependencies.persistEffect(client, junctionId, effect, now));
+      if (effect.type === "SET_DESIRED_SIGNALS") {
+        commands.push(await this.dependencies.persistEffect(client, junctionId, effect, now));
+      }
     }
 
     if (!idleTick) {
-      const eventType = input.type !== "TICK"
-        ? input.type
-        : state.mode !== result.state.mode
-          ? "MODE_TIMEOUT"
-          : result.effects.length > 0
-            ? "TICK_TRANSITION"
-            : "TICK_STATE_CHANGE";
-      await this.dependencies.appendAudit(client, {
-        junctionId,
-        eventType,
-        previousState: `${state.desired.phase}:${state.desired.step}`,
-        newState: `${result.state.desired.phase}:${result.state.desired.step}`,
-        details: { input },
-      });
+      const appendEvent = (eventType: string, details: Record<string, unknown>) =>
+        this.dependencies.appendAudit(client, {
+          junctionId,
+          eventType,
+          previousState: state.mode,
+          newState: result.state.mode,
+          direction: input.type === "MANUAL_MODE_REQUEST" ? input.direction ?? null : null,
+          details: {
+            previousPhase: `${state.desired.phase}:${state.desired.step}`,
+            newPhase: `${result.state.desired.phase}:${result.state.desired.step}`,
+            ...details,
+          },
+        });
+
+      for (const emergency of addedEmergencies) {
+        await appendEvent("EMERGENCY_DETECTED", {
+          emergencyId: emergency.emergencyId,
+          vehicleId: emergency.vehicleId,
+          phase: emergency.phase,
+        });
+        const wasQueuedBehindDifferentPhase = state.emergencyRequests.length > 0 &&
+          activeEmergencyPhase(state) !== emergency.phase;
+        if (wasQueuedBehindDifferentPhase) {
+          await appendEvent("EMERGENCY_QUEUED", {
+            emergencyId: emergency.emergencyId,
+            activeEmergencyId: state.emergencyRequests[0]?.emergencyId ?? null,
+            phase: emergency.phase,
+          });
+        }
+      }
+
+      if (transitionStarted) {
+        await appendEvent("SIGNAL_TRANSITION_STARTED", {
+          targetPhase: result.state.pendingPhase,
+          cause: addedEmergencies.length > 0 ? "EMERGENCY" : input.type,
+        });
+      }
+
+      if (state.mode !== result.state.mode) {
+        await appendEvent("MODE_CHANGE", { from: state.mode, to: result.state.mode });
+      }
+
+      for (const emergency of removedEmergencies) {
+        const eventType = input.type === "TICK" ? "EMERGENCY_EXPIRED" : "EMERGENCY_CLEARED";
+        await appendEvent(eventType, {
+          emergencyId: emergency.emergencyId,
+          vehicleId: emergency.vehicleId,
+          phase: emergency.phase,
+        });
+      }
+
+      if (result.effects.some((effect) => effect.type === "AUDIT_UNSAFE_STATE")) {
+        await appendEvent("UNSAFE_STATE_FALLBACK", { input, effects: result.effects });
+      }
+
+      if (input.type !== "TICK" || stateChanged || queueChanged || result.effects.length > 0) {
+        const eventType = input.type !== "TICK"
+          ? input.type
+          : state.mode !== result.state.mode
+            ? "MODE_TIMEOUT"
+            : result.effects.length > 0
+              ? "TICK_TRANSITION"
+              : "TICK_STATE_CHANGE";
+        await appendEvent(eventType, { input, effects: result.effects });
+      }
     }
 
     return { junctionId, state: result.state, effects: result.effects, commands };
@@ -400,12 +462,46 @@ export class JunctionService {
         await this.dependencies.getActiveVehicles(junctionId, client),
       );
       const actual = { phase, step, signals: signalsFor(phase, step), confirmedAt: now };
-      const next = {
+      const next: JunctionState = {
         ...current,
+        mode: current.mode === "DEGRADED" ? "AUTOMATIC" : current.mode,
+        manualOverride: current.mode === "DEGRADED" ? null : current.manualOverride,
         actual,
         desired: current.desired.step === step && current.desired.phase === phase
           ? { phase, step, signals: signalsFor(phase, step) }
           : current.desired,
+      };
+      if (current.mode === "DEGRADED") {
+        await this.dependencies.updateJunctionState(
+          client,
+          junctionId,
+          "AUTOMATIC",
+          next.actual.phase,
+          "ONLINE",
+        );
+      }
+      return next;
+    }));
+    this.stateCache.set(junctionId, state);
+    await this.dependencies.emit({ type: "JUNCTION_STATE", junctionId, state, effects: [] });
+  }
+
+  async setDegraded(junctionId: string, now: number): Promise<void> {
+    const state = await this.runSerialized(junctionId, () => this.dependencies.transact(async (client) => {
+      const row = await this.dependencies.lockJunction(client, junctionId);
+      if (row === undefined) throw new Error(`Junction not found: ${junctionId}`);
+      const current = this.stateCache.get(junctionId) ?? stateFromRow(
+        row,
+        await this.dependencies.getQueues(junctionId, client),
+        await this.dependencies.getActiveVehicles(junctionId, client),
+      );
+      const redSignals = allRed();
+      const unknownSignals = allUnknown();
+      const next: JunctionState = {
+        ...current,
+        mode: "DEGRADED",
+        desired: { phase: current.desired.phase, step: "ALL_RED", signals: redSignals },
+        actual: { phase: current.actual.phase, step: "UNKNOWN", signals: unknownSignals, confirmedAt: now },
       };
       return next;
     }));
@@ -416,6 +512,10 @@ export class JunctionService {
   clearCachedState(junctionId: string): void {
     this.stateCache.delete(junctionId);
   }
+}
+
+function activeEmergencyPhase(state: JunctionState): Phase | null {
+  return state.emergencyRequests[0]?.phase ?? null;
 }
 
 export function isJunctionInput(input: TrafficInput): boolean {

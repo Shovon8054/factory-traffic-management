@@ -88,3 +88,12 @@ export async function supersedePendingCommands(
   );
   return result.rowCount ?? 0;
 }
+
+export async function getPendingCommands(
+  client: PoolClient | typeof pool = pool,
+): Promise<TrafficCommandRow[]> {
+  const result = await client.query<TrafficCommandRow>(
+    "SELECT id, command_id, junction_id, command, direction, requested_state, status, created_at, acknowledged_at FROM traffic_commands WHERE status = 'PENDING' ORDER BY id ASC",
+  );
+  return result.rows;
+}

@@ -9,6 +9,7 @@ const vehicleTypeSchema = z.enum([
   "MOTORCYCLE",
   "BUS",
   "TRUCK",
+  "FORKLIFT",
   "EMERGENCY",
   "EMPLOYEE_VEHICLE",
 ]);
@@ -49,10 +50,20 @@ const commandSchema = z.discriminatedUnion("type", [
   }),
 ]);
 
+const manualCommandSchema = z.discriminatedUnion("command", [
+  z.object({
+    command: z.literal("MANUAL_GREEN_REQUEST"),
+    direction: directionSchema,
+  }),
+  z.object({
+    command: z.literal("RETURN_TO_AUTOMATIC"),
+  }),
+]);
+
 const controllerAckSchema = z.object({
-  commandId: z.string().trim().min(1).max(100),
+  commandId: z.string().trim().min(1).max(100).nullable().optional(),
   junctionId: z.string().trim().min(1).max(50),
-  status: z.enum(["ACKNOWLEDGED", "FAILED", "TIMED_OUT"]),
+  status: z.enum(["ACKNOWLEDGED", "FAILED", "TIMED_OUT", "OFFLINE", "ONLINE"]),
   actualState: z.string().trim().min(1).max(20).nullable().optional(),
 });
 
@@ -97,6 +108,17 @@ export function createApiRouter(dependencies?: ApiControllerDependencies): Route
   router.post("/commands", asyncHandler(async (request, response) => {
     const input = commandSchema.parse(request.body);
     sendResult(response, await controller.command(input, Date.now()));
+  }));
+
+  router.post("/junctions/:junctionId/commands", asyncHandler(async (request, response) => {
+    const junctionId = z.string().trim().min(1).max(50).parse(request.params.junctionId);
+    const input = manualCommandSchema.parse(request.body);
+    sendResult(response, await controller.manualCommand(
+      junctionId,
+      input.command,
+      input.command === "MANUAL_GREEN_REQUEST" ? input.direction : undefined,
+      Date.now(),
+    ));
   }));
 
   router.get("/commands/:commandId", asyncHandler(async (request, response) => {

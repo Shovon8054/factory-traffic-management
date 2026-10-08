@@ -6,7 +6,8 @@ import type { SensorHandlingResult } from "../services/sensor.service.ts";
 
 function createTestApp(overrides: Partial<ApiControllerDependencies> = {}) {
   const sensorResults = new Map<string, SensorHandlingResult>([
-    ["duplicate-event", { status: "DUPLICATE", reason: "already processed" }],
+    ["duplicate-event", { status: "DUPLICATE", duplicate: true, reason: "already processed" }],
+    ["unmatched-clear", { status: "UNMATCHED_CLEAR", reason: "vehicle has no active arrival" }],
     ["stale-event", { status: "STALE", reason: "too old" }],
     ["out-of-order-event", { status: "OUT_OF_ORDER", reason: "sequence is old" }],
   ]);
@@ -75,7 +76,17 @@ describe("REST API", () => {
     await request(app).post("/api/sensor-events").send({
       ...validSensorEvent,
       eventId: "duplicate-event",
-    }).expect(200);
+    }).expect(200).expect(({ body }) => {
+      expect(body.duplicate).toBe(true);
+    });
+    await request(app).post("/api/sensor-events").send({
+      ...validSensorEvent,
+      eventId: "unmatched-clear",
+      eventType: "CLEARED",
+    }).expect(409).expect(({ body }) => {
+      expect(body.error.code).toBe("UNMATCHED_CLEAR");
+      expect(body.error.message).toContain("active arrival");
+    });
     await request(app).post("/api/sensor-events").send({
       ...validSensorEvent,
       eventId: "stale-event",
@@ -111,6 +122,52 @@ describe("REST API", () => {
     await request(app).get("/api/commands?junctionId=A&limit=20").expect(200);
     await request(app).get("/api/commands/cmd-1").expect(200);
     await request(app).get("/api/commands/missing").expect(404);
+  });
+
+  it("accepts direction-based manual commands without exposing direct signal-state control", async () => {
+    const inputs: unknown[] = [];
+    const app = createTestApp({
+      junctionService: {
+        getState: async () => ({ mode: "AUTOMATIC" } as never),
+        process: async (_junctionId, input) => {
+          inputs.push(input);
+          return { mode: input.type === "RETURN_TO_AUTOMATIC" ? "AUTOMATIC" : "MANUAL" } as never;
+        },
+      },
+    });
+
+    for (const [direction, phase] of [["NORTH", "NORTH_SOUTH"], ["SOUTH", "NORTH_SOUTH"], ["EAST", "EAST_WEST"], ["WEST", "EAST_WEST"]] as const) {
+      await request(app).post("/api/junctions/A/commands").send({
+        command: "MANUAL_GREEN_REQUEST",
+        direction,
+      }).expect(201);
+      expect(inputs.at(-1)).toEqual({ type: "MANUAL_MODE_REQUEST", direction, phase });
+    }
+
+    await request(app).post("/api/junctions/A/commands").send({
+      command: "RETURN_TO_AUTOMATIC",
+    }).expect(201);
+    expect(inputs.at(-1)).toEqual({ type: "RETURN_TO_AUTOMATIC" });
+    await request(app).post("/api/junctions/A/signals").send({ direction: "NORTH", state: "GREEN" }).expect(404);
+  });
+
+  it("rejects invalid, unknown-junction, and emergency manual requests without processing state", async () => {
+    let processCalls = 0;
+    const app = createTestApp({
+      junctionService: {
+        getState: async () => ({ mode: "EMERGENCY" } as never),
+        process: async () => {
+          processCalls += 1;
+          return {} as never;
+        },
+      },
+    });
+    await request(app).post("/api/junctions/A/commands").send({ command: "MANUAL_GREEN_REQUEST", direction: "NORTH" }).expect(409);
+    await request(app).post("/api/junctions/A/commands").send({ command: "MANUAL_GREEN_REQUEST", direction: "UP" }).expect(400);
+    await request(app).post("/api/junctions/A/commands").send({ command: "MANUAL_GREEN_REQUEST" }).expect(400);
+    await request(app).post("/api/junctions/A/commands").send({ command: "NOT_A_COMMAND", direction: "NORTH" }).expect(400);
+    await request(app).post("/api/junctions/missing/commands").send({ command: "MANUAL_GREEN_REQUEST", direction: "NORTH" }).expect(404);
+    expect(processCalls).toBe(0);
   });
 
   it("maps controller ACK outcomes and serves events/history", async () => {

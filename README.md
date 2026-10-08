@@ -7,6 +7,7 @@ A traffic-signal management system for factory junctions. The backend is Node.js
 ## 2. Deliverables and Feature Coverage
 
 - Pure `decide(state, input, now)` engine with safety assertions, weighted queues, starvation prevention, max-green timing, emergency precedence, and manual TTL.
+- Automatic phase scoring uses default weights CAR 1, MOTORCYCLE 1.2, BUS 2, TRUCK 1.5, FORKLIFT 2.5, EMPLOYEE_VEHICLE 1.25, and EMERGENCY 10. Ordinary switches require a score advantage of at least 0.5 after minimum green and anti-flap dwell; starvation and max-green are overrides when the competing phase has traffic.
 - Per-junction serialized service operations and PostgreSQL transactions using `SELECT ... FOR UPDATE`.
 - PostgreSQL models for junctions/queues, sensor events, commands, controller events, and audit history.
 - Sensor validation for invalid, duplicate, stale, and out-of-order events.
@@ -62,12 +63,13 @@ Safety invariants:
 - Conflicting phase groups (NORTH/SOUTH and EAST/WEST) are never GREEN together.
 - A conflicting GREEN is never requested directly from GREEN; the path is GREEN → YELLOW → ALL_RED → GREEN.
 - Manual and emergency requests use that same path. Emergency requests take precedence over manual mode and are served earliest-first.
+- Repeated emergency sightings refresh only `lastSeenAt`; conflicting emergencies remain FIFO-queued, while same-phase emergencies can share service. Clearing an emergency removes it from priority; a still-live manual override resumes, otherwise the junction returns to automatic mode. Emergency priority expires after the configured stale interval without a refresh.
 - Duplicate vehicle arrivals, unknown clears, duplicate commands, unknown ACKs, stale sensor events, and late ACKs are handled without silently advancing actual state.
 - Tick processing is periodic; request handlers do not sleep.
 
 ## 5. Database Schema
 
-The project uses the existing tables in `backend/sql/db.sql`; no schema changes are required by this implementation:
+The project uses the six existing tables; no schema changes are required by this implementation. Fresh installations use the ordered scripts `backend/sql/001_initial_schema.sql` and `backend/sql/002_seed_data.sql`:
 
 | Table | Purpose |
 | --- | --- |
@@ -86,7 +88,14 @@ Prerequisites: Node.js 24 or a compatible Node.js release, npm, and PostgreSQL. 
 
 ```bash
 createdb -h 127.0.0.1 -p 5432 -U postgres factory_traffic
-psql -h 127.0.0.1 -p 5432 -U postgres -d factory_traffic -f backend/sql/db.sql
+psql -h 127.0.0.1 -p 5432 -U postgres -d factory_traffic -f backend/sql/001_initial_schema.sql
+psql -h 127.0.0.1 -p 5432 -U postgres -d factory_traffic -f backend/sql/002_seed_data.sql
+```
+
+The seed script inserts Junction A and its four zero-count approaches. To run the isolated PostgreSQL verification against the configured DB server (it creates and drops a uniquely named temporary database):
+
+```bash
+npm --prefix backend exec -- tsx scripts/database-verification.ts
 ```
 
 If PostgreSQL listens on another port, use that port in both commands and `DB_PORT`. Create `backend/.env` with the local connection values (do not commit credentials):
@@ -146,7 +155,7 @@ All endpoints are mounted at `/api` and JSON requests use `Content-Type: applica
 | `GET /controller-events?junctionId=A&limit=100` | List controller events | `200`, `400`, `404` |
 | `GET /history?junctionId=A&limit=100` | List audit history | `200`, `400`, `404` |
 
-Sensor event body fields: `eventId`, `junctionId`, `direction`, `eventType`, `vehicleId`, `sensorTimestamp`; `vehicleType` is required for arrival events, and `sequenceNo` is optional. Directions are `NORTH`, `SOUTH`, `EAST`, `WEST`. Vehicle types are `CAR`, `MOTORCYCLE`, `BUS`, `TRUCK`, `EMERGENCY`, `EMPLOYEE_VEHICLE`. Query `limit` is an integer from 1 to 500.
+Sensor event body fields: `eventId`, `junctionId`, `direction`, `eventType`, `vehicleId`, `sensorTimestamp`; `vehicleType` is required for arrival events, and `sequenceNo` is optional. Directions are `NORTH`, `SOUTH`, `EAST`, `WEST`. Vehicle types are `CAR`, `MOTORCYCLE`, `BUS`, `TRUCK`, `FORKLIFT`, `EMERGENCY`, `EMPLOYEE_VEHICLE`. Query `limit` is an integer from 1 to 500.
 
 ## 9. Curl Commands for the 9 Scenarios
 

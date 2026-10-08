@@ -86,3 +86,17 @@ export async function updateJunctionState(
   );
   return result.rows[0];
 }
+
+export async function createJunction(
+  client: PoolClient,
+  junctionId: string,
+  name: string,
+): Promise<JunctionRow> {
+  const result = await client.query<JunctionRow>(
+    "INSERT INTO junctions (id, name) VALUES ($1, $2) RETURNING id, name, mode, current_phase, controller_status, created_at, updated_at",
+    [junctionId, name],
+  );
+  const row = result.rows[0];
+  if (row === undefined) throw new Error("Junction insert returned no row");
+  return row;
+}

@@ -30,6 +30,17 @@ export async function createControllerEvent(
   return row;
 }
 
+export async function getControllerEventById(
+  eventId: number,
+  client: PoolClient | typeof pool = pool,
+): Promise<ControllerEventRow | undefined> {
+  const result = await client.query<ControllerEventRow>(
+    "SELECT id, command_id, junction_id, status, actual_state, created_at FROM controller_events WHERE id = $1",
+    [eventId],
+  );
+  return result.rows[0];
+}
+
 export async function listControllerEvents(
   junctionId: string,
   limit = 100,

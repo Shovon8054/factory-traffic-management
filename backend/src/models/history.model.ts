@@ -55,3 +55,14 @@ export async function getHistory(
   );
   return result.rows;
 }
+
+export async function getHistoryEntryById(
+  entryId: number,
+  client: PoolClient | typeof pool = pool,
+): Promise<AuditLogRow | undefined> {
+  const result = await client.query<AuditLogRow>(
+    "SELECT id, junction_id, event_type, direction, previous_state, new_state, command_id, details, created_at FROM audit_logs WHERE id = $1",
+    [entryId],
+  );
+  return result.rows[0];
+}

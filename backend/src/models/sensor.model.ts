@@ -67,6 +67,30 @@ export async function getSensorEventById(
   return result.rows[0];
 }
 
+export async function updateSensorEventStatus(
+  eventId: string,
+  status: string,
+  client: PoolClient | typeof pool = pool,
+): Promise<SensorEventRow | undefined> {
+  const result = await client.query<SensorEventRow>(
+    "UPDATE sensor_events SET status = $2 WHERE event_id = $1 RETURNING id, event_id, junction_id, direction, event_type, vehicle_id, vehicle_type, sequence_no, sensor_timestamp, received_at, status",
+    [eventId, status],
+  );
+  return result.rows[0];
+}
+
+export async function listSensorEvents(
+  junctionId: string,
+  limit = 100,
+  client: PoolClient | typeof pool = pool,
+): Promise<SensorEventRow[]> {
+  const result = await client.query<SensorEventRow>(
+    "SELECT id, event_id, junction_id, direction, event_type, vehicle_id, vehicle_type, sequence_no, sensor_timestamp, received_at, status FROM sensor_events WHERE junction_id = $1 ORDER BY received_at DESC, id DESC LIMIT $2",
+    [junctionId, limit],
+  );
+  return result.rows;
+}
+
 export async function getLatestSensorSequence(
   junctionId: string,
   direction: string,

@@ -88,6 +88,22 @@ function createFakeServices(): {
     getSensorEventById: async (eventId) => events.get(eventId),
     getLatestSensorSequence: async () => latestSeq,
     getLatestSensorTimestamp: async () => latestTimestamp,
+    getActiveVehicles: async () => {
+      const latestByVehicle = new Map<string, SensorEventRow>();
+      for (const event of events.values()) {
+        if (event.status !== "PROCESSED" || event.vehicle_id === null) continue;
+        latestByVehicle.set(event.vehicle_id, event);
+      }
+      return [...latestByVehicle.values()]
+        .filter((event) => event.event_type === "ARRIVED" || event.event_type === "VEHICLE_ARRIVED")
+        .map((event) => ({
+          vehicle_id: event.vehicle_id!,
+          direction: event.direction,
+          vehicle_type: event.vehicle_type,
+          sensor_timestamp: event.sensor_timestamp,
+          received_at: event.received_at,
+        }));
+    },
     insertSensorEvent: async (event) => {
       if (events.has(event.eventId)) return undefined;
       const sensorRow: SensorEventRow = {
@@ -218,6 +234,7 @@ describe("SensorService concurrency", () => {
       sensorTimestamp: new Date(now),
     }, now + 1);
     expect(duplicate.status).toBe("DUPLICATE");
+    expect(duplicate).toMatchObject({ duplicate: true });
 
     const outOfOrder = await fake.sensorService.handle({
       eventId: "sensor-old-sequence",
@@ -259,5 +276,42 @@ describe("SensorService concurrency", () => {
       sensorTimestamp: new Date(now),
     }, now);
     expect(invalid.status).toBe("INVALID");
+  });
+
+  it("rejects a second active vehicle arrival and an unmatched clear without changing queues", async () => {
+    const fake = createFakeServices();
+    const now = 3_000_000;
+    const arrival = {
+      junctionId: "A",
+      direction: "NORTH",
+      eventType: "VEHICLE_ARRIVED",
+      vehicleId: "same-vehicle",
+      vehicleType: "TRUCK",
+      sensorTimestamp: new Date(now),
+    };
+    const first = await fake.sensorService.handle({ ...arrival, eventId: "arrival-one" }, now);
+    expect(first.status).toBe("ACCEPTED");
+
+    const duplicateVehicle = await fake.sensorService.handle({
+      ...arrival,
+      eventId: "arrival-two",
+      sequenceNo: 2,
+      sensorTimestamp: new Date(now + 1),
+    }, now + 1);
+    expect(duplicateVehicle).toMatchObject({ status: "DUPLICATE", duplicate: true });
+    expect(fake.queueCount()).toBe(1);
+
+    const unmatchedClear = await fake.sensorService.handle({
+      eventId: "clear-unmatched",
+      junctionId: "A",
+      direction: "EAST",
+      eventType: "VEHICLE_CLEARED",
+      vehicleId: "never-arrived",
+      sensorTimestamp: new Date(now + 2),
+    }, now + 2);
+    expect(unmatchedClear.status).toBe("UNMATCHED_CLEAR");
+    expect(fake.queueCount()).toBe(1);
+    expect(fake.auditEvents()).toContain("SENSOR_DUPLICATE_VEHICLE");
+    expect(fake.auditEvents()).toContain("SENSOR_UNMATCHED_CLEAR");
   });
 });

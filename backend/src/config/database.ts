@@ -1,4 +1,4 @@
-import pg, { type PoolClient } from "pg";
+import pg, { type Pool as PgPool, type PoolClient } from "pg";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -25,8 +25,9 @@ export default pool;
 
 export async function withTransaction<T>(
   operation: (client: PoolClient) => Promise<T>,
+  connectionPool: PgPool = pool,
 ): Promise<T> {
-  const client = await pool.connect();
+  const client = await connectionPool.connect();
 
   try {
     await client.query("BEGIN");
