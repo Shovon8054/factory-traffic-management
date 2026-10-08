@@ -55,7 +55,15 @@ export interface CommandRow {
   acknowledged_at: string | null
 }
 
-const API_BASE = (import.meta.env.VITE_API_URL ?? 'http://localhost:5000/api').replace(/\/$/, '')
+function getApiBase(): string {
+  const raw = (import.meta.env.VITE_API_URL ?? '').trim()
+  if (!raw || raw.includes('<') || raw.includes('>') || raw.includes('(')) {
+    return 'http://localhost:5000/api'
+  }
+  return raw.replace(/\/$/, '')
+}
+
+const API_BASE = getApiBase()
 const SOCKET_BASE = API_BASE.replace(/\/api$/, '')
 
 function getInitialJunctionId(): string {
