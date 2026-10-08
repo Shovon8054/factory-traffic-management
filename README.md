@@ -1,5 +1,14 @@
 # Factory Traffic Management System
 
+## 🌐 Live Deployments
+
+- **Frontend Dashboard (Vercel)**: [https://factory-traffic-management-zeta.vercel.app](https://factory-traffic-management-zeta.vercel.app)
+- **Backend API Server (Render)**: [https://factory-traffic-management-0qel.onrender.com](https://factory-traffic-management-0qel.onrender.com)
+- **API Base URL**: `https://factory-traffic-management-0qel.onrender.com/api`
+- **Health / Status Check**: `https://factory-traffic-management-0qel.onrender.com/`
+
+---
+
 ## 1. Project Overview
 
 A traffic-signal management system for factory junctions. The backend is Node.js, Express, TypeScript, PostgreSQL (`pg` with parameterized SQL), and Socket.IO. The frontend is React and Vite. A pure traffic decision engine handles phase selection; services serialize junction work, validate sensor events, persist changes, and communicate with a controller gateway.
@@ -141,21 +150,81 @@ At boot the server tests the DB connection, rebuilds active vehicle queues from 
 
 ## 8. REST API Reference
 
-All endpoints are mounted at `/api` and JSON requests use `Content-Type: application/json`.
+All endpoints are mounted at `/api` (Production: `https://factory-traffic-management-0qel.onrender.com/api`, Local: `http://localhost:5000/api`) and JSON requests use `Content-Type: application/json`.
 
-| Method and path | Purpose | Typical response |
+### Endpoints Overview
+
+| Method and Path | Description | Typical Responses |
 | --- | --- | --- |
-| `GET /junctions` | List junctions | `200` |
-| `GET /junctions/:junctionId/status` | Junction row, queues, desired/actual engine snapshot | `200`, `404` |
-| `POST /sensor-events` | Validate and ingest a sensor event | `201` accepted, `200` duplicate, `400` invalid, `404` junction missing, `409` stale/out-of-order |
-| `POST /commands` | `TARGET_PHASE_REQUEST`, `MANUAL_MODE_REQUEST`, `EMERGENCY_REQUEST`, or `RETURN_TO_AUTOMATIC` | `201`, `400`, `404` |
-| `GET /commands?junctionId=A&limit=100` | List commands for a junction | `200`, `400`, `404` |
-| `GET /commands/:commandId` | Read one command | `200`, `404` |
-| `POST /controller-events` | Submit controller ACK/status | `201` matched/recorded, `200` duplicate, `400` invalid, `404` unknown command/junction, `409` late ACK |
-| `GET /controller-events?junctionId=A&limit=100` | List controller events | `200`, `400`, `404` |
-| `GET /history?junctionId=A&limit=100` | List audit history | `200`, `400`, `404` |
+| `GET /` | Root health check & server status | `200 OK` |
+| `GET /api/junctions` | List all monitored junctions | `200 OK` |
+| `GET /api/junctions/:junctionId/status` | Current junction row, queue counts, desired & actual engine states | `200 OK`, `404 Not Found` |
+| `POST /api/sensor-events` | Ingest vehicle detection & clearing sensor events (idempotent) | `201 Accepted`, `200 Duplicate`, `400 Invalid`, `404 Not Found`, `409 Stale/Out-of-order` |
+| `POST /api/commands` | Dispatch phase commands (`TARGET_PHASE_REQUEST`, `MANUAL_MODE_REQUEST`, `EMERGENCY_REQUEST`, `RETURN_TO_AUTOMATIC`) | `201 Created`, `400 Bad Request`, `404 Not Found` |
+| `POST /api/junctions/:junctionId/commands` | Submit directional manual control (`MANUAL_GREEN_REQUEST`, `RETURN_TO_AUTOMATIC`) | `201 Created`, `400 Bad Request`, `404 Not Found` |
+| `GET /api/commands?junctionId=A&limit=100` | List commands log for a junction | `200 OK`, `400 Bad Request`, `404 Not Found` |
+| `GET /api/commands/:commandId` | Retrieve a single command record by ID | `200 OK`, `404 Not Found` |
+| `POST /api/controller-events` | Controller hardware acknowledgement & status ingestion | `201 Matched`, `200 Duplicate`, `400 Invalid`, `404 Not Found`, `409 Late ACK` |
+| `GET /api/controller-events?junctionId=A&limit=100` | List controller ACK events for a junction | `200 OK`, `400 Bad Request`, `404 Not Found` |
+| `GET /api/history?junctionId=A&limit=100` | List audit history events | `200 OK`, `400 Bad Request`, `404 Not Found` |
 
-Sensor event body fields: `eventId`, `junctionId`, `direction`, `eventType`, `vehicleId`, `sensorTimestamp`; `vehicleType` is required for arrival events, and `sequenceNo` is optional. Directions are `NORTH`, `SOUTH`, `EAST`, `WEST`. Vehicle types are `CAR`, `MOTORCYCLE`, `BUS`, `TRUCK`, `FORKLIFT`, `EMERGENCY`, `EMPLOYEE_VEHICLE`. Query `limit` is an integer from 1 to 500.
+---
+
+### Request Payload Schemas & Examples
+
+#### 1. Sensor Event (`POST /api/sensor-events`)
+```json
+{
+  "eventId": "sensor-evt-1001",
+  "junctionId": "A",
+  "direction": "NORTH",
+  "eventType": "ARRIVED",
+  "vehicleId": "truck-42",
+  "vehicleType": "TRUCK",
+  "sequenceNo": 1,
+  "sensorTimestamp": "2026-10-08T15:30:00.000Z"
+}
+```
+* Allowed `direction`: `NORTH`, `SOUTH`, `EAST`, `WEST`
+* Allowed `eventType`: `ARRIVED`, `CLEARED`, `VEHICLE_ARRIVED`, `VEHICLE_CLEARED`
+* Allowed `vehicleType`: `CAR`, `MOTORCYCLE`, `BUS`, `TRUCK`, `FORKLIFT`, `EMERGENCY`, `EMPLOYEE_VEHICLE`
+
+#### 2. Phase / Emergency Command (`POST /api/commands`)
+* **Target Phase**:
+  ```json
+  { "type": "TARGET_PHASE_REQUEST", "junctionId": "A", "phase": "EAST_WEST" }
+  ```
+* **Manual Override**:
+  ```json
+  { "type": "MANUAL_MODE_REQUEST", "junctionId": "A", "phase": "EAST_WEST" }
+  ```
+* **Emergency Priority**:
+  ```json
+  { "type": "EMERGENCY_REQUEST", "junctionId": "A", "emergencyId": "em-01", "phase": "NORTH_SOUTH", "occurredAt": 1728400000000 }
+  ```
+* **Return to Automatic**:
+  ```json
+  { "type": "RETURN_TO_AUTOMATIC", "junctionId": "A" }
+  ```
+
+#### 3. Directional Manual Command (`POST /api/junctions/:junctionId/commands`)
+```json
+{
+  "command": "MANUAL_GREEN_REQUEST",
+  "direction": "NORTH"
+}
+```
+
+#### 4. Controller Acknowledgment (`POST /api/controller-events`)
+```json
+{
+  "commandId": "cmd-uuid-or-null",
+  "junctionId": "A",
+  "status": "ACKNOWLEDGED",
+  "actualState": "ALL_RED"
+}
+```
+* Allowed `status`: `ACKNOWLEDGED`, `FAILED`, `TIMED_OUT`, `OFFLINE`, `ONLINE`
 
 ## 9. Curl Commands for the 9 Scenarios
 
